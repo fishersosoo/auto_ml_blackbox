@@ -3,9 +3,9 @@ import tensorflow as tf
 import numpy as np
 from tensorflow.python.ops import standard_ops
 
-MAX_LEN = 32
-INPUT_DIM = 300
-DIM = 128
+MAX_LEN = 32  # 最大文本长度
+INPUT_DIM = 300  # 输入维度
+DIM = 128  # 隐含层维度
 
 
 def weihgt(w, x):
@@ -70,7 +70,7 @@ class DAGBuilder():
                                     activation=tf.keras.activations.sigmoid, bias_initializer='glorot_uniform')
         state = None
         all_edges = []
-        all_prob=[]
+        all_prob = []
         for layer_id in range(1, num_layers + 1):
             outputs, final_memory_state, final_carry_state = lstm(inputs, initial_state=state)
             state = [final_memory_state, final_carry_state]
@@ -81,14 +81,9 @@ class DAGBuilder():
             logits = tf.stack([1 - logits, logits])  # [2, node_num * node_num]
             edges = tf.cast(tf.random.categorical(tf.transpose(logits), 1), dtype=tf.float32)  # [node_num * node_num,1]
             edges = mask_layer(tf.reshape(edges, [1, 1, node_num * node_num]))
-            edges = tf.squeeze(edges, axis=[0,1])
+            edges = tf.squeeze(edges, axis=[0, 1])
             all_edges.append(edges)
             inputs = tf.reshape(edges, [1, 1, node_num * node_num])
-
-        # @tf.function
-        # def stack_func(tensor):
-        #     batch_size = tf.shape(tensor)[0]
-        #     all_edges = tf.expand_dims(all_edges, axis=0)
 
         all_edges = tf.stack(all_edges)
 
@@ -100,6 +95,15 @@ class DAGBuilder():
         return controller
 
     def buildDAG(self, class_num):
+        """
+        TODO:还有问题，清对照《算法流程.docx》修改
+
+        Args:
+            class_num:
+
+        Returns:
+
+        """
         node_num = self.node_num
         input = tf.keras.Input(shape=[MAX_LEN, INPUT_DIM])
         edges = tf.keras.Input(shape=[node_num, node_num])
@@ -130,6 +134,14 @@ class DAGBuilder():
 
 class DAGModel(tf.keras.Model):
     def __init__(self, model, controller, class_num, node_num):
+        """
+
+        Args:
+            model: DAG模型
+            controller: controller模型
+            class_num: 类别数量
+            node_num: 节点数量
+        """
         super(DAGModel, self).__init__()
         self.model = model
         self.controller = controller
@@ -140,6 +152,15 @@ class DAGModel(tf.keras.Model):
         self.g_loss = tf.losses.categorical_crossentropy
 
     def train_step(self, data):
+        """
+        TODO:还有问题，清对照《算法流程.docx》修改
+        自定义训练循环
+        Args:
+            data: 训练输入
+
+        Returns:
+
+        """
         input_embeddings = data[0]  # [b, MAX_LEN, INPUT_DIM]
         labels = data[1]  # [b]
         batch_size = tf.shape(input_embeddings)[0]
@@ -148,25 +169,25 @@ class DAGModel(tf.keras.Model):
         all_edges = tf.squeeze(all_edges, axis=[0])  # [controller_num_layers,node_num * node_num]
         M = tf.shape(all_edges)[0]  # controller_num_layers
         all_edges = tf.reshape(all_edges, [M, self.node_num, self.node_num])
-        all_grads=[]
-        all_model_loss=[]
+        all_grads = []
+        all_model_loss = []
         for i in range(M):
             with tf.GradientTape() as tape:
-                edges=tf.reshape(all_edges[M],[1,-1])
-                edges=tf.tile(edges,[BATCH_SIZE,1])
+                edges = tf.reshape(all_edges[M], [1, -1])
+                edges = tf.tile(edges, [BATCH_SIZE, 1])
                 predictions = self.model(inputs=[input_embeddings, edges])
                 model_loss = self.g_loss(tf.one_hot(labels, depth=self.class_num), predictions)
             grads = tape.gradient(model_loss, self.model.trainable_weights)
             all_grads.append(grads)
             all_model_loss.append(model_loss)
         self.g_optimizer.apply_gradients(
-            zip(tf.reduce_mean(tf.stack(all_grads),axis=0), self.model.trainable_weights)
+            zip(tf.reduce_mean(tf.stack(all_grads), axis=0), self.model.trainable_weights)
         )
 
         all_edges = self.controller(tf.zeros([1, 1]))  # [1, controller_num_layers,node_num * node_num]
         all_edges = tf.squeeze(all_edges, axis=[0])  # [controller_num_layers,node_num * node_num]
-        all_c_grads=[]
-        all_c_loss=[]
+        all_c_grads = []
+        all_c_loss = []
         for i in range(M):
             with tf.GradientTape() as tape:
                 edges = tf.reshape(all_edges[M], [1, -1])
@@ -175,7 +196,7 @@ class DAGModel(tf.keras.Model):
                 controller_loss = self.g_loss(tf.one_hot(labels, depth=self.class_num), predictions)
 
         with tf.GradientTape() as tape:
-            repeat_embeddings = tf.tile(input_embeddings, [M, 1, 1]) # [B*M,node_num * node_num]
+            repeat_embeddings = tf.tile(input_embeddings, [M, 1, 1])  # [B*M,node_num * node_num]
             repeat_labels = tf.tile(labels, [M])
             repeat_edges = tf.tile(all_edges, [batch_size, 1, 1])
             predictions = self.model(inputs=[repeat_embeddings, repeat_edges])
@@ -184,18 +205,20 @@ class DAGModel(tf.keras.Model):
         self.c_optimizer.apply_gradients(
             zip(grads, self.controller.trainable_weights)
         )
-        return {'model_loss':tf.reduce_mean(tf.stack(all_model_loss),axis=0) , "controller_loss": controller_loss}
+        return {'model_loss': tf.reduce_mean(tf.stack(all_model_loss), axis=0), "controller_loss": controller_loss}
 
 
 if __name__ == '__main__':
+    # 使用随机数据作为训练数据
+    # TODO:后面会改为使用公开数据集数据
     train_dataset = tf.data.Dataset.from_tensor_slices(
         (np.random.random([16 * 10, MAX_LEN, INPUT_DIM]), np.random.random_integers(0, 1, [16 * 10])))
     BATCH_SIZE = 16
     SHUFFLE_BUFFER_SIZE = 100
     train_dataset = train_dataset.shuffle(SHUFFLE_BUFFER_SIZE).batch(BATCH_SIZE)
-    node_num=6
-    class_num=2
-    M=4
+    node_num = 6
+    class_num = 2
+    M = 4  # 每次训练蒙特卡洛采样次数
     dag = DAGBuilder(node_num)
     model = dag.buildDAG(class_num)
     # print(model.trainable_weights)
