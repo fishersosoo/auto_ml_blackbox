@@ -2,11 +2,24 @@
 import pandas as pd
 import os
 import json
-import numpy as np
+
 
 class TNewsData:
-    def __init__(self):
-        pass
+    """
+    TNEWS新闻标题分类数据集
+    [label_id, label, label_desc, sentence, keywords]
+    """
+
+    def __init__(self, dir=None, source_dir=None):
+        self.num_class = 15
+        if dir is not None:
+            self.training_set = pd.read_csv(os.path.join(dir, "train.csv"), index_col=None, encoding='utf-8')
+            self.test_set = pd.read_csv(os.path.join(dir, "test.csv"), index_col=False, encoding='utf-8')
+            self.eval_set = pd.read_csv(os.path.join(dir, "eval.csv"), index_col=False, encoding='utf-8')
+        elif source_dir is not None:
+            self.read_source_dir(source_dir)
+        else:
+            raise Exception("dir or source_dir needed")
 
     @staticmethod
     def _from_json(path):
@@ -24,82 +37,36 @@ class TNewsData:
         df = pd.DataFrame(data)
         return df
 
-    @staticmethod
-    def read_source_dir(dir):
+    def __getitem__(self, item):
+        if item == "train":
+            return self.training_set
+        if item == "test":
+            return self.test_set
+        if item == "eval":
+            return self.eval_set
+        raise KeyError(f"key {item} not found in {type(self)}")
+
+    def read_source_dir(self, dir):
         dev_set = TNewsData._from_json(os.path.join(dir, "dev.json"))
-        test_set = TNewsData._from_json(os.path.join(dir, "models.json"))
-        train_set = TNewsData._from_json(os.path.join(dir, "train.json"))
+        test_set = TNewsData._from_json(os.path.join(dir, "test.json"))
+        training_set = TNewsData._from_json(os.path.join(dir, "train.json"))
         labels = TNewsData._from_json(os.path.join(dir, "labels.json"))
-        return train_set, test_set, dev_set, labels
+        labels["label_id"] = labels.index
+        self.num_class = max(labels.index)
+        labels = labels.drop(columns=['label_desc'])
+        labels = labels.set_index('label')
+        dev_set = dev_set.join(labels, on="label")
+        training_set = training_set.join(labels, on="label")
+        self.training_set = training_set
+        self.test_set = test_set
+        self.eval_set = dev_set
 
-
-def read_vectors(path, topn=0):  # read top n word vectors, i.e. top is 10000
-    lines_num, dim = 0, 0
-    vectors = {}
-    iw = []
-    wi = {}
-    with open(path, encoding='utf-8', errors='ignore') as f:
-        first_line = True
-        for line in f:
-            if first_line:
-                first_line = False
-                dim = int(line.rstrip().split()[1])
-                continue
-            lines_num += 1
-            tokens = line.rstrip().split(' ')
-            vectors[tokens[0]] = np.asarray([float(x) for x in tokens[1:]])
-            iw.append(tokens[0])
-            if topn != 0 and lines_num >= topn:
-                break
-    for i, w in enumerate(iw):
-        wi[w] = i
-    return vectors, iw, wi, dim
-
-def encode(vectors,text):
-    embeddings=[]
-    for char in text:
-        embeddings.append(vectors[char])
-    return embeddings
-
-class encoder():
-    def __init__(self,path,topn=0):
-        lines_num, dim = 0, 0
-        vectors = {}
-        iw = []
-        wi = {}
-        with open(path, encoding='utf-8', errors='ignore') as f:
-            first_line = True
-            for line in f:
-                if first_line:
-                    first_line = False
-                    dim = int(line.rstrip().split()[1])
-                    continue
-                lines_num += 1
-                tokens = line.rstrip().split(' ')
-                vectors[tokens[0]] = np.asarray([float(x) for x in tokens[1:]])
-                iw.append(tokens[0])
-                if topn != 0 and lines_num >= topn:
-                    break
-        for i, w in enumerate(iw):
-            wi[w] = i
-        self.vectors=vectors
-        self.iw=iw
-        self.wi=wi
-        self.dim=dim
-
-    def encode(self,text,max_len):
-        embeddings = []
-        for char in text[:max_len]:
-            embeddings.append(self.vectors.get(char,default=0.))
-        for len(embeddings)<max_len:
-            embeddings.append([])
-
+    def export_dataset(self, output_dir):
+        self.training_set.to_csv(os.path.join(output_dir, "train.csv"), index=False, encoding='utf-8')
+        self.test_set.to_csv(os.path.join(output_dir, "test.csv"), index=False, encoding='utf-8')
+        self.eval_set.to_csv(os.path.join(output_dir, "eval.csv"), index=False, encoding='utf-8')
 
 
 if __name__ == '__main__':
-    # train_set, test_set, dev_set, labels = TNewsData.read_source_dir(
-    #     "data/source/chineseGLUEdatasets.v0.0.1/tnews_public")
-
-    vectors,iw, wi, dim=read_vectors(r"Z:\auto_ml\models\sgns.renmin.char")
-    embeddings=encode(vectors,"史丹福")
-
+    data = TNewsData(source_dir="/home/auto_ml/data/source/chineseGLUEdatasets.v0.0.1/tnews_public")
+    data.export_dataset('/home/auto_ml/data/source/TNewsData')
