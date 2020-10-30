@@ -8,30 +8,34 @@ INPUT_DIM = 300  # 输入维度
 DIM = 128  # 隐含层维度
 
 
-def weihgt(w, x):
-    # w[a,b] * x[..., a] →[... , b]
-    rank = x.shape.rank
-    outputs = standard_ops.tensordot(x, w, [[rank - 1], [0]])
-    return outputs
+def build_DAG_model(num_node, max_len, input_dim, num_class, hidden_size):
+    input_embeddings = tf.keras.Input([max_len, input_dim], name="input_embeddings")
+    input_mask = tf.keras.Input([max_len], name="input_mask", dtype=tf.bool)
+    edges = tf.keras.Input([num_node, num_node], name="edges")  # 对于整个batch，edges都是一样的
+    edges = tf.stop_gradient(edges)
+    nodes = [tf.keras.layers.GRU(hidden_size, return_sequences=True) for one in range(num_node)]
+    node_output = []
+    for j, node in enumerate(nodes):
+        if j == 0:
+            y = nodes[j](input_embeddings)
+            node_output.append(y)
+        else:
+            all_node_output = tf.stack(node_output, axis=2)  # [b,l,j-1,d]
+            input_to_j = tf.reshape(edges[:, :j, j], [-1, 1, j - 1, 1])  # [b,1 j-1,1]
+            node_input = tf.reduce_sum(input_to_j * all_node_output, axis=2)  # [b,l,d]
+            y = nodes[j](node_input)
+            node_output.append(y)
+    is_leaf = tf.reduce_sum(edges, axis=2)  # [b, n]
+    is_leaf = tf.reshape(tf.keras.activations.relu(1 - is_leaf), [-1, 1, node_num, 1])  # [B, 1, N, 1]
+    sum_node_input=tf.stack(node_output, axis=2)  # [b,l,n,d]
+    sum_node_input=tf.reduce_sum(is_leaf*sum_node_input, axis=2) # [b,l,d]
+    output_y = tf.keras.layers.Dense(num_class,activation='sigmoid')(sum_node_input[:, 0, :])  # [B,class_num]
+    prob = tf.keras.layers.Softmax(name="prob")(output_y)
+    label = tf.keras.layers.Lambda(tf.argmax, arguments={'axis': -1}, name="label")(output_y)
+    model = tf.keras.Model(inputs=[input_embeddings, edges,input_mask], outputs=[prob, label])
+    return model
 
 
-def random_connection(node_num):
-    edges = []
-    for i in range(node_num):
-        # node-i output to where
-        edges.append([0] * (i + 1) + np.random.random_integers(1, 1, [node_num - i - 1]).tolist())
-    return np.array(edges)
-
-
-class EdgesMaskLayer(tf.keras.layers.Layer):
-    def __init__(self, node_num):
-        super(EdgesMaskLayer, self).__init__()
-        self.node_num = node_num
-        self.mask = self.add_weight(shape=[node_num, node_num], trainable=False, initializer=maskInitializer(node_num))
-
-    def call(self, inputs, **kwargs):
-        mask = tf.reshape(self.mask, [1, 1, self.node_num * self.node_num])
-        return inputs * mask
 
 
 class maskInitializer(tf.keras.initializers.Initializer):
@@ -54,82 +58,9 @@ def stack_func(tensor, all_edges, node_num, num_layers):
     return tf.broadcast_to(all_edges, shape=[batch_size, num_layers, node_num * node_num])
 
 
-class DAGBuilder():
-    def __init__(self, node_num):
-        self.node_num = node_num
 
-    def buildController(self, controller_num_layers):
-        num_layers = controller_num_layers
-        node_num = self.node_num
-        mask_layer = EdgesMaskLayer(node_num=node_num)
 
-        input_tensor = tf.keras.Input(shape=[1])
 
-        inputs = tf.zeros([1, 1, node_num * node_num])
-        lstm = tf.keras.layers.LSTM(node_num * node_num, return_sequences=True, return_state=True,
-                                    activation=tf.keras.activations.sigmoid, bias_initializer='glorot_uniform')
-        state = None
-        all_edges = []
-        all_prob = []
-        for layer_id in range(1, num_layers + 1):
-            outputs, final_memory_state, final_carry_state = lstm(inputs, initial_state=state)
-            state = [final_memory_state, final_carry_state]
-            logits = mask_layer(outputs)  # [1,1, node_num*node_num]
-            all_prob.append(logits)
-            logits = tf.reshape(logits, [node_num * node_num])
-
-            logits = tf.stack([1 - logits, logits])  # [2, node_num * node_num]
-            edges = tf.cast(tf.random.categorical(tf.transpose(logits), 1), dtype=tf.float32)  # [node_num * node_num,1]
-            edges = mask_layer(tf.reshape(edges, [1, 1, node_num * node_num]))
-            edges = tf.squeeze(edges, axis=[0, 1])
-            all_edges.append(edges)
-            inputs = tf.reshape(edges, [1, 1, node_num * node_num])
-
-        all_edges = tf.stack(all_edges)
-
-        all_edges = tf.broadcast_to(all_edges, shape=[tf.shape(input_tensor)[0], num_layers, node_num * node_num])
-
-        # all_edges=tf.keras.layers.Lambda(stack_func)(inputs)
-        controller = tf.keras.Model(inputs=input_tensor,
-                                    outputs=all_edges)  # [b,controller_num_layers,node_num * node_num]
-        return controller
-
-    def buildDAG(self, class_num):
-        """
-        TODO:还有问题，清对照《算法流程.docx》修改
-
-        Args:
-            class_num:
-
-        Returns:
-
-        """
-        node_num = self.node_num
-        input = tf.keras.Input(shape=[MAX_LEN, INPUT_DIM])
-        edges = tf.keras.Input(shape=[node_num, node_num])
-        nodes = [tf.keras.layers.GRU(DIM, return_sequences=True, activation=tf.keras.activations.relu) for one in
-                 range(node_num)]
-        node_output = []
-        for j, node in enumerate(nodes):
-            if j == 0:
-                y = nodes[j](input)
-                node_output.append(y)
-            else:
-                mask = tf.reshape(edges[:, :j, j], [-1, j, 1, 1])  # [b,j,1]
-                mask = tf.tile(mask, [1, 1, MAX_LEN, DIM])  # [b, j, L, D]
-                stacked = tf.stack(node_output, axis=1)  # [b, j, L, D]
-                stacked = tf.multiply(mask, stacked)  # [b, j, L, D]
-                y = tf.reduce_sum(stacked, axis=1)  # [b, L, D]
-                node_output.append(y)
-        is_leaf = tf.reduce_sum(edges, axis=2)  # [b, n]
-        is_leaf = tf.reshape(tf.keras.activations.relu(1 - is_leaf), [-1, 1, 1, node_num])  # [B, 1, 1, N]
-        is_leaf = tf.tile(is_leaf, [1, MAX_LEN, DIM, 1])  # [B,L,D,N]
-        sum_node = tf.transpose(tf.stack(node_output, axis=1), perm=[0, 2, 3, 1])  # [B,L,D,N]
-        sum_node = tf.multiply(is_leaf, sum_node)
-        sum_node = tf.reduce_sum(sum_node, axis=-1)  # [B,L,D]
-        output_y = tf.keras.layers.Dense(class_num)(sum_node[:, 0, :])  # [B,class_num]
-        model = tf.keras.Model(inputs=[input, edges], outputs=output_y)
-        return model
 
 
 class DAGModel(tf.keras.Model):
@@ -167,7 +98,8 @@ class DAGModel(tf.keras.Model):
 
         all_edges = self.controller(tf.zeros([1, 1]))  # [1, controller_num_layers,node_num * node_num]
         all_edges = tf.squeeze(all_edges, axis=[0])  # [controller_num_layers,node_num * node_num]
-        M = tf.shape(all_edges)[0]  # controller_num_layers
+        # M = tf.shape(all_edges)[0]  # controller_num_layers
+        M = 5
         all_edges = tf.reshape(all_edges, [M, self.node_num, self.node_num])
         all_grads = []
         all_model_loss = []
@@ -202,6 +134,7 @@ class DAGModel(tf.keras.Model):
             predictions = self.model(inputs=[repeat_embeddings, repeat_edges])
             controller_loss = self.g_loss(tf.one_hot(repeat_labels, depth=self.class_num), predictions)
         grads = tape.gradient(controller_loss, self.controller.trainable_weights)
+        print(grads)
         self.c_optimizer.apply_gradients(
             zip(grads, self.controller.trainable_weights)
         )
@@ -225,13 +158,6 @@ if __name__ == '__main__':
     controller = dag.buildController(M)
     enas = DAGModel(model=model, controller=controller, class_num=2, node_num=6)
     enas.compile()
-    enas.fit(train_dataset, epochs=100)
-    # features = tf.Variable((np.random.random([1, 3])), dtype=tf.float32)
-    # model(features)
-    # model.compile(optimizer=tf.keras.optimizers.RMSprop(),
-    #               loss=tf.keras.losses.mean_squared_error,
-    #               metrics=[tf.keras.metrics.mean_squared_error])
-    # logdir = r'Z:\auto_ml\models'
-    # tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=logdir)
-    # model.fit(train_dataset, epochs=10, callbacks=[tensorboard_callback])
+    enas.fit(train_dataset, epochs=10)
+
     print(tf.reshape(enas.controller(tf.zeros([1, 1])), [1, M, node_num, node_num]))
