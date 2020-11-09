@@ -63,3 +63,8 @@ class PretrainTokenizer():
             embeddings.append(padding_vec)
         mask = [1] * max_index + [0] * (max_len - max_index)
         return np.array(embeddings), np.array(mask,dtype=float)
+
+
+class FullTokenizer():
+    def __init__(self):
+        pass

@@ -6,32 +6,7 @@ import tensorflow as tf
 import numpy as np
 
 
-class AdditiveAttention(tf.keras.layers.Layer):
-    def __init__(self, *args, **kwargs):
-        super(AdditiveAttention, self).__init__(*args, **kwargs)
-
-    def build(self, input_shape):
-        self.w_1 = tf.keras.layers.Dense(input_shape[-1], use_bias=False, activation=None)
-        self.w_2 = tf.keras.layers.Dense(input_shape[-1], use_bias=False, activation=None)
-        self.w_a = tf.keras.layers.Dense(1, use_bias=False, activation=tf.nn.sigmoid)
-
-    def call(self, inputs, **kwargs):
-        """
-
-        Args:
-            inputs: [key, query],key: [b, j-1, d], query: [b,1, d]
-            **kwargs:
-
-        Returns:
-            # [b, j-1,1]
-        """
-        key, query = inputs
-        score = tf.keras.activations.tanh(self.w_1(query) + self.w_2(key))  # [b, j-1, d]
-        score = self.w_a(score)  # [b, j-1, 1]
-        return score
-
-
-def build_controller_model(num_node, link_embedding_dim, hidden_size):
+def build_controller_model(num_node, hidden_size, controller_temperature, controller_tanh_constant):
     """
 
     Args:
@@ -48,58 +23,73 @@ def build_controller_model(num_node, link_embedding_dim, hidden_size):
         和[num_node, num_type]的类型矩阵
     """
 
-    input_tensor = tf.keras.Input(shape=[1], name="input")  # [B,1]
-    batch_size = 1
-    link_embedding_layer = tf.keras.layers.Dense(link_embedding_dim, use_bias=False, name="link_embedding")
-    link_lstm_layer = tf.keras.layers.LSTM(hidden_size, return_sequences=False, return_state=True,
+    input_tensor = tf.keras.Input(shape=[1], name="input_tensor", dtype=tf.float32)  # [B,1]
+    batch_size = tf.shape(input_tensor)[0]
+
+    link_embedding_layer = tf.keras.layers.Embedding(input_dim=num_node - 1, output_dim=hidden_size,
+                                                     name="link_embedding_layer")
+
+    link_lstm_layer = tf.keras.layers.LSTM(hidden_size, return_sequences=False, return_state=True, trainable=True,
                                            recurrent_activation=None, name="link_lstm")
-    init_link_input = tf.Variable(initial_value=tf.initializers.glorot_uniform()([1, link_embedding_dim]),
-                                  shape=[1, link_embedding_dim], trainable=True, name="init_link_inputs")
-    # 加性注意力
-    link_atten_w_1 = tf.keras.layers.Dense(hidden_size, use_bias=False, activation=None)
-    link_atten_w_2 = tf.keras.layers.Dense(hidden_size, use_bias=False, activation=None)
-    link_atten_w_a = tf.keras.layers.Dense(1, use_bias=False, activation=tf.nn.sigmoid)
+    init_link_input = tf.keras.layers.Dense(hidden_size, use_bias=False, activation=None, trainable=True,
+                                            name="init_link_inputs")
+    # 加性注意力层
+    link_atten_w_1 = tf.keras.layers.Dense(hidden_size, use_bias=False, activation=None, trainable=True, name="w_1")
+    link_atten_w_2 = tf.keras.layers.Dense(hidden_size, use_bias=False, activation=None, trainable=True, name="w_2")
+    link_atten_w_a = tf.keras.layers.Dense(1, use_bias=False, activation=None, trainable=True, name="w_a")
 
-    inputs = init_link_input
-    inputs = tf.broadcast_to(inputs, shape=[batch_size, link_embedding_dim])  # [B, link_embedding_dim]
-    link_state = None
-    all_link_outputs = [inputs]  # 连接向量lstm层的输出 [j, B, link_embedding_dim]
-    inputs = tf.reshape(inputs, [batch_size, 1, link_embedding_dim])
-    all_links = [tf.zeros(shape=[batch_size, num_node])]  # 生成的连接向量
+    # 初始化输入
+    init_link_embedding = init_link_input(input_tensor)  # [B, link_embedding_dim]
+    all_h = [tf.broadcast_to(tf.zeros(shape=[1, hidden_size]),
+                             shape=[batch_size, hidden_size])]  # 连接向量lstm层的输出 [j, B, link_embedding_dim]
+    all_h_w = [tf.broadcast_to(tf.zeros(shape=[1, hidden_size]),
+                               shape=[batch_size, hidden_size])]
+    all_links = [tf.broadcast_to(tf.zeros(shape=[1, num_node]),
+                                 shape=[batch_size, num_node])]  # 生成的连接向量 [b,1,n],最后会堆叠成[b,n,n]
 
-    all_link_ce_loss = []  # [num_node, B]
+    all_ce_loss = []  # 损失[B,num_node-1]
+    all_prob = []  # [B,num_node-1(stack axis), num_node]
+
+    lstm_input = tf.expand_dims(init_link_embedding, 1)  # [B,1, link_embedding_dim]
+    lstm_state = None
+
     for j in range(2, num_node + 1):
-        link_o, link_c, link_h = link_lstm_layer(inputs, initial_state=link_state)  # [B, link_embedding_dim]
-        link_state = [link_c, link_h]
-        all_link_outputs.append(link_o)  # [j, B, link_embedding_dim]
-        key = tf.transpose(tf.stack(all_link_outputs[:-1], axis=0), perm=[1, 0, 2])  # [B,j-1, link_embedding_dim]
-        query = tf.reshape(link_o, [batch_size, 1, link_embedding_dim])  # [B,1, link_embedding_dim]
+        _, link_c, link_h = link_lstm_layer(lstm_input,
+                                            initial_state=lstm_state)  # [B, link_embedding_dim]
+        lstm_state = [link_c, link_h]
+        all_h.append(link_h)  # [j, B, link_embedding_dim]
 
-        # 使用加性注意力机制
-        score = tf.keras.activations.tanh(link_atten_w_1(query) + link_atten_w_2(key))  # [b, j-1, d]
-        logits = link_atten_w_a(score)  # [B, j-1,1] 表示选择该边作为输入的概率
+        all_h_w.append(link_atten_w_1(link_h))
+        query = link_atten_w_2(link_h)
 
-        # 根据概率采样
-        logits_reshape = tf.reshape(logits, [-1, 1])  # [B * (j-1),1]
-        link = tf.random.categorical(tf.math.log(tf.concat([1. - logits_reshape, logits_reshape], axis=-1)),
-                                     1)  # [B * (j-1),1]
-        link = tf.reshape(link, [batch_size, j - 1])
-        link_padding = tf.reshape(tf.pad(link, [[0, 0], [0, num_node - j + 1]]),
-                                  [batch_size,  num_node])  # [B,  num_node]
-        all_links.append(tf.cast(link_padding, dtype=tf.float32))
+        key = tf.transpose(tf.stack(all_h_w[:-1], axis=0), perm=[1, 0, 2])  # [B,j-1, link_embedding_dim]
+        query = tf.reshape(query, [batch_size, 1, hidden_size])  # [B,1, link_embedding_dim]
+        query = tf.nn.tanh(query + key)  # [B,j-1, link_embedding_dim]
 
-        inputs = link_embedding_layer(tf.reshape(link_padding,[batch_size,1,num_node]) ) # [B, 1, link_embedding_dim]
+        logits = link_atten_w_a(query)  # [B,j-1, 1]
+        logits = logits / controller_temperature
+        logits = controller_tanh_constant * tf.nn.tanh(logits)
+        logits = tf.squeeze(logits, -1)  # [B, j-1] 前置节点概率
 
-        # 计算loss，如果使用这个link_ce_loss计算梯度的话，lstm会趋向生成和采样结果相同的分布
-        link_ce_loss = tf.losses.sparse_categorical_crossentropy(link,
-                                                                 tf.concat([1. - logits, logits], axis=-1))  # [B, j-1]
-        all_link_ce_loss.append(tf.reduce_sum(link_ce_loss, axis=-1))  # [B]
+        prob = tf.pad(logits, [[0, 0], [0, num_node - j + 1]])  # [B, num_node]
+        all_prob.append(prob)
 
-    all_link = tf.broadcast_to(tf.stack(all_links, axis=1),
-                               shape=[tf.shape(input_tensor)[0], num_node, num_node])  # [B, num_node, num_node]
-    link_ce_loss = tf.broadcast_to(tf.reduce_sum(tf.stack(all_link_ce_loss), axis=0),
-                                   shape=[tf.shape(input_tensor)[0]])  # [B]
+        # 根据概率采样获得前置节点id和前置节点向量表示
+        input_node_id = tf.squeeze(tf.random.categorical(logits, 1), axis=[-1])  # [B]
+        link = tf.one_hot(input_node_id, depth=num_node)  # [B,num_node]
+        link_embedding = link_embedding_layer(tf.expand_dims(input_node_id, -1))  # [B,1,link_embedding_dim]
 
+        # 计算损失
+        ce_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,
+                                                                 labels=tf.stop_gradient(input_node_id),
+                                                                 name=f"controller_ce_{j}")  # [B]
+        all_links.append(link)
+        all_ce_loss.append(ce_loss)
+
+        lstm_input = link_embedding  # [B, 1, link_embedding_dim]
+    all_prob = tf.stack(all_prob, 1)  # [B, num_node-1, num_node]
+    all_links = tf.stack(all_links, 1)
+    all_ce_loss = tf.stack(all_ce_loss, axis=-1)  # [B,num_node-1]
     model = tf.keras.Model(inputs=[input_tensor],
-                           outputs=[all_link, link_ce_loss])
+                           outputs=[all_links, all_ce_loss, all_prob])
     return model
